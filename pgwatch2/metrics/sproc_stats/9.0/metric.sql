@@ -14,4 +14,4 @@ FROM
 ORDER BY
   total_time DESC
 LIMIT
-  300;
+  10;

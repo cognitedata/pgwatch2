@@ -25,4 +25,4 @@ ORDER BY
   coalesce(toast_blks_hit, 0) +
   coalesce(tidx_blks_read, 0) +
   coalesce(tidx_blks_hit, 0)
-  DESC LIMIT 300;
+  DESC LIMIT 10;
