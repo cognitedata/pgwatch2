@@ -79,7 +79,7 @@ FROM (
             total_time > 0
         ORDER BY
             total_time DESC
-        LIMIT 100) a
+        limit 10) a
 UNION
 SELECT
     *
@@ -90,7 +90,7 @@ FROM (
         q_data
     ORDER BY
         calls DESC
-    LIMIT 100) a
+    limit 10) a
 UNION
 SELECT
     *
@@ -103,7 +103,7 @@ FROM (
         shared_blks_read > 0
     ORDER BY
         shared_blks_read DESC
-    LIMIT 100) a
+    limit 10) a
 UNION
 SELECT
     *
@@ -116,7 +116,7 @@ FROM (
         shared_blks_written > 0
     ORDER BY
         shared_blks_written DESC
-    LIMIT 100) a
+    limit 10) a
 UNION
 SELECT
     *
@@ -129,7 +129,7 @@ FROM (
         temp_blks_read > 0
     ORDER BY
         temp_blks_read DESC
-    LIMIT 100) a
+    limit 10) a
 UNION
 SELECT
     *
@@ -142,4 +142,4 @@ FROM (
         temp_blks_written > 0
     ORDER BY
         temp_blks_written DESC
-    LIMIT 100) a) b;
+    limit 10) a) b;
