@@ -244,7 +244,7 @@ const RECO_PREFIX = "reco_"                                       // special han
 const RECO_METRIC_NAME = "recommendations"
 const SPECIAL_METRIC_CHANGE_EVENTS = "change_events"
 const SPECIAL_METRIC_SERVER_LOG_EVENT_COUNTS = "server_log_event_counts"
-const SPECIAL_METRIC_PGBOUNCER_STATS = "pgbouncer_stats"
+const SPECIAL_METRIC_PGBOUNCER = "^pgbouncer_(stats|pools)$"
 const SPECIAL_METRIC_PGPOOL_STATS = "pgpool_stats"
 const SPECIAL_METRIC_INSTANCE_UP = "instance_up"
 const SPECIAL_METRIC_DB_SIZE = "db_size"         // can be transparently switched to db_size_approx on instances with very slow FS access (Azure Single Server)
@@ -292,7 +292,7 @@ var InfluxSkipSSLCertVerify, InfluxSkipSSLCertVerify2 bool
 var fileBasedMetrics = false
 var adHocMode = false
 var preset_metric_def_map map[string]map[string]float64 // read from metrics folder in "file mode"
-/// internal statistics calculation
+// / internal statistics calculation
 var lastSuccessfulDatastoreWriteTimeEpoch int64
 var datastoreWriteFailuresCounter uint64
 var datastoreWriteSuccessCounter uint64
@@ -324,6 +324,7 @@ var instanceMetricCacheTimestampLock = sync.RWMutex{}
 var MinExtensionInfoAvailable, _ = decimal.NewFromString("9.1")
 var regexIsAlpha = regexp.MustCompile("^[a-zA-Z]+$")
 var rBouncerAndPgpoolVerMatch = regexp.MustCompile(`\d+\.+\d+`) // extract $major.minor from "4.1.2 (karasukiboshi)" or "PgBouncer 1.12.0"
+var regexIsPgbouncerMetrics = regexp.MustCompile(SPECIAL_METRIC_PGBOUNCER)
 var tryDirectOSStats bool
 var unreachableDBsLock sync.RWMutex
 var unreachableDB = make(map[string]time.Time)
@@ -504,9 +505,9 @@ func InitAndTestMetricStoreConnection(connStr string, failOnErr bool) error {
 			break
 		}
 	}
-	metricDb.SetMaxIdleConns(1)
+	metricDb.SetMaxIdleConns(2)
 	metricDb.SetMaxOpenConns(2)
-	metricDb.SetConnMaxLifetime(time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS))
+	metricDb.SetConnMaxLifetime(time.Second * 172800) // 2d
 	return nil
 }
 
@@ -648,7 +649,7 @@ func DBExecInExplicitTX(conn *sqlx.DB, host_ident, sql string, args ...interface
 	}
 
 	ctx := context.Background()
-	txOpts := go_sql.TxOptions{}
+	txOpts := go_sql.TxOptions{ReadOnly: true}
 
 	tx, err := conn.BeginTxx(ctx, &txOpts)
 	if err != nil {
@@ -730,7 +731,11 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 	}
 
 	if !useConnPooling {
-		sqlLockTimeout = "SET lock_timeout TO '100ms';"
+		if IsPostgresDBType(md.DBType) {
+			sqlLockTimeout = "SET lock_timeout TO '100ms';"
+		} else {
+			sqlLockTimeout = ""
+		}
 	}
 
 	sqlToExec := sqlLockTimeout + sqlStmtTimeout + sql // bundle timeouts with actual SQL to reduce round-trip times
@@ -739,7 +744,16 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 	if useConnPooling {
 		data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
 	} else {
-		data, err = DBExecRead(conn, dbUnique, sqlToExec, args...)
+		if IsPostgresDBType(md.DBType) {
+			data, err = DBExecRead(conn, dbUnique, sqlToExec, args...)
+		} else {
+			for _, sql := range strings.Split(sqlToExec, ";") {
+				sql = strings.TrimSpace(sql)
+				if len(sql) > 0 {
+					data, err = DBExecRead(conn, dbUnique, sql, args...)
+				}
+			}
+		}
 	}
 	t2 := time.Now()
 	if err != nil {
@@ -995,7 +1009,7 @@ retry:
 			}
 
 			if epoch_ns == 0 {
-				if !ts_warning_printed && msg.MetricName != SPECIAL_METRIC_PGBOUNCER_STATS {
+				if !ts_warning_printed && !regexIsPgbouncerMetrics.MatchString(msg.MetricName) {
 					log.Warning("No timestamp_ns found, (gatherer) server time will be used. measurement:", msg.MetricName)
 					ts_warning_printed = true
 				}
@@ -1089,7 +1103,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 			}
 
 			if epoch_ns == 0 {
-				if !ts_warning_printed && msg.MetricName != SPECIAL_METRIC_PGBOUNCER_STATS {
+				if !ts_warning_printed && !regexIsPgbouncerMetrics.MatchString(msg.MetricName) {
 					log.Warning("No timestamp_ns found, server time will be used. measurement:", msg.MetricName)
 					ts_warning_printed = true
 				}
@@ -1499,6 +1513,7 @@ func AddDBUniqueMetricToListingTable(db_unique, metric string) error {
 
 func UniqueDbnamesListingMaintainer(daemonMode bool) {
 	// due to metrics deletion the listing can go out of sync (a trigger not really wanted)
+	sql_get_advisory_lock := `SELECT pg_try_advisory_lock(1571543679778230000) AS have_lock` // 1571543679778230000 is just a random bigint
 	sql_top_level_metrics := `SELECT table_name FROM admin.get_top_level_metric_tables()`
 	sql_distinct := `
 	WITH RECURSIVE t(dbname) AS (
@@ -1518,6 +1533,17 @@ func UniqueDbnamesListingMaintainer(daemonMode bool) {
 	for {
 		if daemonMode {
 			time.Sleep(time.Hour * 24)
+		}
+
+		log.Infof("Trying to get metricsDb listing maintaner advisory lock...") // to only have one "maintainer" in case of a "push" setup, as can get costly
+		lock, err := DBExecRead(metricDb, METRICDB_IDENT, sql_get_advisory_lock)
+		if err != nil {
+			log.Error("Getting metricsDb listing maintaner advisory lock failed:", err)
+			continue
+		}
+		if !(lock[0]["have_lock"].(bool)) {
+			log.Info("Skipping admin.all_distinct_dbname_metrics maintenance as another instance has the advisory lock...")
+			continue
 		}
 
 		log.Infof("Refreshing admin.all_distinct_dbname_metrics listing table...")
@@ -3159,7 +3185,7 @@ retry_with_superuser_sql: // if 1st fetch with normal SQL fails, try with SU SQL
 			}
 
 			log.Infof("[%s:%s] fetched %d rows in %.1f ms", msg.DBUniqueName, msg.MetricName, len(data), float64(duration.Nanoseconds())/1000000)
-			if msg.MetricName == SPECIAL_METRIC_PGBOUNCER_STATS { // clean unwanted pgbouncer pool stats here as not possible in SQL
+			if regexIsPgbouncerMetrics.MatchString(msg.MetricName) { // clean unwanted pgbouncer pool stats here as not possible in SQL
 				data = FilterPgbouncerData(data, md.DBName, vme)
 			}
 
@@ -5758,11 +5784,11 @@ func main() {
 						continue
 					} else if lastKnownStatusInRecovery != ver.IsInRecovery {
 						if ver.IsInRecovery && len(host.MetricsStandby) > 0 {
-							log.Warningf("Switching metrics collection for \"%s\" to standby config...", db_unique)
+							log.Debugf("[%s] Switching metrics collection to standby config...", db_unique)
 							metric_config = host.MetricsStandby
 							hostLastKnownStatusInRecovery[db_unique] = true
 						} else {
-							log.Warningf("Switching metrics collection for \"%s\" to primary config...", db_unique)
+							log.Debugf("[%s] Using primary config for metrics collection as no standby config defined for host...", db_unique)
 							metric_config = host.Metrics
 							hostLastKnownStatusInRecovery[db_unique] = false
 							SetRecoveryIgnoredDBState(db_unique, false)
