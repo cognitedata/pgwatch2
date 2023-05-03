@@ -134,4 +134,4 @@ select * from (
       group by
            1, 2, 3, 4
 ) x
-order by table_size_b desc nulls last limit 10; -- for Cognite
+order by table_size_b desc nulls last limit 20; -- for Cognite

@@ -91,4 +91,4 @@ order by
   coalesce(toast_blks_hit, 0) +
   coalesce(tidx_blks_read, 0) +
   coalesce(tidx_blks_hit, 0)
-  desc limit 10;
+  desc limit 20;
