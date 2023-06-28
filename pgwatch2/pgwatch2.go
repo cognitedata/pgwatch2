@@ -123,6 +123,7 @@ type MetricAttrs struct {
 	IsInstanceLevel           bool                 `yaml:"is_instance_level"`
 	MetricStorageName         string               `yaml:"metric_storage_name"`
 	ExtensionVersionOverrides []ExtensionOverrides `yaml:"extension_version_based_overrides"`
+	PrerequisiteExtensions    []string             `yaml:"prerequisite_extensions"`
 	IsPrivate                 bool                 `yaml:"is_private"`                // used only for extension overrides currently and ignored otherwise
 	DisabledDays              string               `yaml:"disabled_days"`             // Cron style, 0 = Sunday. Ranges allowed: 0,2-4
 	DisableTimes              []string             `yaml:"disabled_times"`            // "11:00-13:00"
@@ -730,28 +731,28 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 		}
 	}
 
-	if !useConnPooling {
-		if IsPostgresDBType(md.DBType) {
+	if IsPostgresDBType(md.DBType) {
+		if !useConnPooling {
 			sqlLockTimeout = "SET lock_timeout TO '100ms';"
-		} else {
-			sqlLockTimeout = ""
 		}
+	} else {
+		sqlLockTimeout = ""
 	}
 
 	sqlToExec := sqlLockTimeout + sqlStmtTimeout + sql // bundle timeouts with actual SQL to reduce round-trip times
 	//log.Debugf("Executing SQL: %s", sqlToExec)
 	t1 := time.Now()
-	if useConnPooling {
-		data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
-	} else {
-		if IsPostgresDBType(md.DBType) {
-			data, err = DBExecRead(conn, dbUnique, sqlToExec, args...)
+	if IsPostgresDBType(md.DBType) {
+		if useConnPooling {
+			data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
 		} else {
-			for _, sql := range strings.Split(sqlToExec, ";") {
-				sql = strings.TrimSpace(sql)
-				if len(sql) > 0 {
-					data, err = DBExecRead(conn, dbUnique, sql, args...)
-				}
+			data, err = DBExecRead(conn, dbUnique, sqlToExec, args...)
+		}
+	} else {
+		for _, sql := range strings.Split(sqlToExec, ";") {
+			sql = strings.TrimSpace(sql)
+			if len(sql) > 0 {
+				data, err = DBExecRead(conn, dbUnique, sql, args...)
 			}
 		}
 	}
@@ -3098,6 +3099,17 @@ func FetchMetrics(msg MetricFetchMessage, host_state map[string]map[string]strin
 		return nil, err
 	}
 
+	for _, prereqExt := range mvp.MetricAttrs.PrerequisiteExtensions {
+		if _, ok := vme.Extensions[prereqExt]; !ok {
+			epoch, ok2 := last_sql_fetch_error.Load(msg.MetricName + DB_METRIC_JOIN_STR + "prereq")
+			if !ok2 || ((time.Now().Unix() - epoch.(int64)) > 3600) { // complain only 1x per hour instead of 10m
+				log.Warningf("[%s:%s] Skipping actual fetch as prerequisite extension '%s' not present", msg.DBUniqueName, msg.MetricName, prereqExt)
+				last_sql_fetch_error.Store(msg.MetricName+DB_METRIC_JOIN_STR+"prereq", time.Now().Unix())
+			}
+			return nil, nil
+		}
+	}
+
 	isCacheable = IsCacheableMetric(msg, mvp)
 	if isCacheable && opts.InstanceLevelCacheMaxSeconds > 0 && msg.Interval.Seconds() > float64(opts.InstanceLevelCacheMaxSeconds) {
 		cachedData = GetFromInstanceCacheIfNotOlderThanSeconds(msg, opts.InstanceLevelCacheMaxSeconds)
@@ -4526,9 +4538,28 @@ func ResolveDatabasesFromConfigEntry(ce MonitoredDatabase) ([]MonitoredDatabase,
 	if err != nil {
 		return md, err
 	}
-
 	for _, d := range data {
+		mainConnString := ce.LibPQConnStr
+		var parsedConnString string
+		if len(mainConnString) > 0 {
+			if strings.Contains(mainConnString, "postgres://") || strings.Contains(mainConnString, "postgresql://") {
+				parsedConnString, err = pq.ParseURL(mainConnString)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				parsedConnString = mainConnString
+			}
+			if strings.Contains(parsedConnString, "dbname=") {
+				dbRegex := regexp.MustCompile(`dbname=\'?\w+\'?`)
+				parsedConnString = dbRegex.ReplaceAllString(parsedConnString, fmt.Sprintf("dbname='%s'", d["datname"].(string)))
+			} else {
+				parsedConnString += fmt.Sprintf(" dbname='%s'", d["datname"].(string))
+			}
+		}
+
 		md = append(md, MonitoredDatabase{
+			LibPQConnStr:         parsedConnString,
 			DBUniqueName:         ce.DBUniqueName + "_" + d["datname_escaped"].(string),
 			DBUniqueNameOrig:     ce.DBUniqueName,
 			DBName:               d["datname"].(string),
