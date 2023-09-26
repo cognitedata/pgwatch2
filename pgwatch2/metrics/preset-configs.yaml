@@ -184,6 +184,7 @@
     bgwriter: 60
     db_stats: 30
     db_size: 300
+    unused_indexes: 300
     locks_mode: 30
     replication: 120
     replication_slots: 120
